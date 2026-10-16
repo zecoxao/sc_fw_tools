@@ -1,0 +1,255 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+sc_fw_merge - assemble a single PS4 syscon (RL78) flash image from the
+sc_fw_update components BLNK (40000001), BASE (40000002) and SYST (40000003).
+
+Each component carries a block table at offset 0x20 describing where its
+blocks live in the chip's flash. The real flashing sequence writes the
+components in order BLNK -> BASE -> SYST, so later writes override earlier
+ones. This tool reproduces that: it starts from an erased (0xFF) image and
+lays each component's blocks at their flash addresses, in flash order.
+
+Inputs may be the raw encrypted components or already-decrypted .dec files;
+encrypted inputs are decrypted (AES-128-CBC) and CMAC-verified automatically.
+"""
+
+import argparse
+import binascii
+import os
+import struct
+import sys
+
+PROG = "sc_fw_merge"
+VERSION = "1.0"
+
+# Published sc_fw_update keys (see sc_fw_decrypt).
+AES_KEY  = binascii.unhexlify("5301C28824B57137A819C042FC119E3F")
+CMAC_KEY = binascii.unhexlify("8F215691AC7EF6510239DD32CC6A2394")
+IV = bytes(16)
+
+MAGIC_PATCH = b"PTCH"
+MAGICS = (MAGIC_PATCH, b"BLNK", b"BASE", b"SYST")
+
+# Flashing / override priority: later wins. Patches override everything.
+FLASH_ORDER = {b"BLNK": 0, b"BASE": 1, b"SYST": 2, MAGIC_PATCH: 3}
+
+DEFAULT_SIZE = 0x60000      # 384 KiB RL78 code flash
+
+
+def eprint(*a):
+    print(*a, file=sys.stderr)
+
+
+def die(msg, code=1):
+    eprint("%s: error: %s" % (PROG, msg))
+    sys.exit(code)
+
+
+def _aes():
+    try:
+        from Crypto.Cipher import AES
+        from Crypto.Hash import CMAC
+        return AES, CMAC
+    except Exception:
+        die("pycryptodome is required to decrypt encrypted inputs.\n"
+            "  python3 -m pip install --user pycryptodome")
+
+
+class Component(object):
+    def __init__(self, path, data, magic, version, blocks, decrypted, cmac_ok):
+        self.path = path
+        self.name = os.path.basename(path)
+        self.data = data
+        self.magic = magic
+        self.version = version
+        self.blocks = blocks            # list of (flash_addr, size, file_off)
+        self.decrypted = decrypted
+        self.cmac_ok = cmac_ok
+
+    @property
+    def end(self):
+        return max((fa + sz for (fa, sz, _) in self.blocks), default=0)
+
+
+def parse_component(path):
+    with open(path, "rb") as f:
+        data = f.read()
+    if len(data) < 0x20:
+        die("%s: too small to be a component" % path)
+
+    decrypted = False
+    cmac_ok = None
+    if data[0x10:0x14] not in MAGICS:
+        # Encrypted: AES-128-CBC decrypt, then CMAC-verify.
+        if len(data) % 16 != 0:
+            die("%s: not plaintext and size not a multiple of 16" % path)
+        AES, CMAC = _aes()
+        data = AES.new(AES_KEY, AES.MODE_CBC, IV).decrypt(data)
+        decrypted = True
+        if data[0x10:0x14] not in MAGICS:
+            die("%s: decryption failed (no BLNK/BASE/SYST/PTCH magic)" % path)
+        c = CMAC.new(CMAC_KEY, ciphermod=AES)
+        c.update(data[0x10:])
+        cmac_ok = (c.digest() == data[:0x10])
+
+    magic = data[0x10:0x14]
+    version, num_blocks, patch_version = struct.unpack("<BBB", data[0x14:0x17])
+    is_patch = magic == MAGIC_PATCH
+
+    blocks = []
+    for i in range(num_blocks):
+        off = 0x20 + 8 * i
+        if off + 6 > len(data):
+            die("%s: truncated block table (entry %d)" % (path, i))
+        raw_off, raw_sz, raw_fa = struct.unpack("<HHH", data[off:off + 6])
+        file_off = (raw_off << 8) + (0x400 if is_patch else 0x110)
+        size = raw_sz << 8
+        flash_addr = raw_fa << 8
+        if is_patch and flash_addr == 0:
+            flash_addr = 0x1000
+        if file_off + size > len(data):
+            die("%s: block %d data runs past end of file "
+                "(off 0x%x size 0x%x > 0x%x)" % (path, i, file_off, size, len(data)))
+        blocks.append((flash_addr, size, file_off))
+
+    return Component(path, data, magic, version, blocks, decrypted, cmac_ok)
+
+
+def assemble(components, size, fill):
+    img = bytearray([fill]) * size
+    # written[i] = index into `components` that last wrote byte i, or -1.
+    written = bytearray([0xFF]) * size   # 0xFF == untouched (we have <4 comps)
+    placements = []
+    for idx, comp in enumerate(components):
+        for (fa, sz, fo) in comp.blocks:
+            end = fa + sz
+            clipped = 0
+            if end > size:
+                clipped = end - size
+                sz_eff = size - fa if fa < size else 0
+            else:
+                sz_eff = sz
+            if sz_eff <= 0:
+                placements.append((comp, fa, sz, 0, clipped))
+                continue
+            overlap = any(written[fa + k] != 0xFF for k in range(sz_eff))
+            img[fa:fa + sz_eff] = comp.data[fo:fo + sz_eff]
+            for k in range(sz_eff):
+                written[fa + k] = idx
+            placements.append((comp, fa, sz_eff, overlap, clipped))
+    # coverage gaps
+    gaps = []
+    i = 0
+    while i < size:
+        if written[i] == 0xFF:
+            j = i
+            while j < size and written[j] == 0xFF:
+                j += 1
+            gaps.append((i, j))
+            i = j
+        else:
+            i += 1
+    return img, placements, gaps
+
+
+def build_parser():
+    p = argparse.ArgumentParser(
+        prog=PROG,
+        description="Merge sc_fw_update components (BLNK/BASE/SYST) into one "
+                    "PS4 syscon RL78 flash image.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Inputs may be in any order and may be encrypted or .dec; they "
+               "are flashed in order BLNK->BASE->SYST (later writes win).")
+    p.add_argument("files", nargs="+", metavar="FILE",
+                   help="component files (40000001 40000002 40000003, or .dec)")
+    p.add_argument("-o", "--output", metavar="PATH", default="syscon_fw.bin",
+                   help="output image path (default: syscon_fw.bin)")
+    p.add_argument("--size", metavar="N", default=None,
+                   help="image size (hex ok, e.g. 0x60000); default: largest "
+                        "block end, min 0x60000")
+    p.add_argument("--fill", metavar="BYTE", default="0xFF",
+                   help="fill byte for uncovered flash (default: 0xFF)")
+    p.add_argument("--order", metavar="M,M,M", default=None,
+                   help="explicit flash order by magic, e.g. BLNK,BASE,SYST "
+                        "(default: BLNK,BASE,SYST,PTCH)")
+    p.add_argument("--no-verify", action="store_true",
+                   help="do not fail if an input's CMAC check fails")
+    p.add_argument("-V", "--version", action="version",
+                   version="%(prog)s " + VERSION)
+    return p
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+
+    try:
+        fill = int(args.fill, 0) & 0xFF
+    except ValueError:
+        die("bad --fill value: %r" % args.fill)
+
+    comps = [parse_component(p) for p in args.files]
+
+    # Order the components.
+    if args.order:
+        want = [m.strip().upper().encode() for m in args.order.split(",")]
+        rank = {m: i for i, m in enumerate(want)}
+        def key(c):
+            return (rank.get(c.magic, len(want)), c.version)
+    else:
+        def key(c):
+            return (FLASH_ORDER.get(c.magic, 99), c.version)
+    comps.sort(key=key)
+
+    # Determine size.
+    max_end = max((c.end for c in comps), default=0)
+    if args.size is not None:
+        try:
+            size = int(args.size, 0)
+        except ValueError:
+            die("bad --size value: %r" % args.size)
+    else:
+        size = max(max_end, DEFAULT_SIZE)
+    if max_end > size:
+        eprint("%s: warning: blocks extend to 0x%x but size is 0x%x (clipping)"
+               % (PROG, max_end, size))
+
+    # CMAC gate.
+    bad = [c for c in comps if c.cmac_ok is False]
+    if bad and not args.no_verify:
+        die("CMAC check failed for: %s (use --no-verify to override)"
+            % ", ".join(c.name for c in bad))
+
+    img, placements, gaps = assemble(comps, size, fill)
+
+    with open(args.output, "wb") as f:
+        f.write(img)
+
+    # Report.
+    eprint("components (flash order):")
+    for c in comps:
+        tag = ("decrypted" if c.decrypted else "plaintext")
+        if c.cmac_ok is True:
+            tag += ", cmac OK"
+        elif c.cmac_ok is False:
+            tag += ", cmac FAIL"
+        eprint("  %-8s v%d  %d blocks  [%s]  %s"
+               % (c.magic.decode("latin1"), c.version, len(c.blocks), tag, c.name))
+    eprint("block placements:")
+    for (c, fa, sz, overlap, clipped) in placements:
+        note = ""
+        if overlap:
+            note += " (overrode earlier)"
+        if clipped:
+            note += " (clipped 0x%x)" % clipped
+        eprint("  %-5s 0x%05x .. 0x%05x  size 0x%05x%s"
+               % (c.magic.decode("latin1"), fa, fa + sz, sz, note))
+    if gaps:
+        eprint("uncovered (filled 0x%02x):" % fill)
+        for (a, b) in gaps:
+            eprint("  0x%05x .. 0x%05x  (0x%05x)" % (a, b, b - a))
+    eprint("wrote %s  (0x%x bytes)" % (args.output, size))
+
+
+if __name__ == "__main__":
+    main()
