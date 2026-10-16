@@ -1,0 +1,221 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+sc_fw_decrypt - decrypt sc_fw_update component images (BLNK / BASE / SYST).
+
+Container layout (per component file 40000001/40000002/40000003):
+
+    whole file  = AES-128-CBC( key, IV = 0 ) encrypted
+    plaintext   = [ 16-byte AES-128-CMAC ][ payload ... ]
+    CMAC        = AES-128-CMAC( cmac_key ) over payload   (= plaintext[16:])
+
+The payload begins with a 4-byte magic:
+    40000001 -> "BLNK"
+    40000002 -> "BASE"
+    40000003 -> "SYST"
+
+Keys are the published defaults; override with --key / --cmac-key if needed.
+"""
+
+import argparse
+import binascii
+import os
+import sys
+
+PROG = "sc_fw_decrypt"
+VERSION = "1.0"
+
+# Published AES-128-CBC key (IV is all zeros) and AES-128-CMAC key.
+DEFAULT_KEY = "5301C28824B57137A819C042FC119E3F"
+DEFAULT_CMAC_KEY = "8F215691AC7EF6510239DD32CC6A2394"
+
+KNOWN_MAGIC = {
+    b"BLNK": "BLNK (40000001)",
+    b"BASE": "BASE (40000002)",
+    b"SYST": "SYST (40000003)",
+}
+
+
+def eprint(*a):
+    print(*a, file=sys.stderr)
+
+
+def die(msg, code=1):
+    eprint("%s: error: %s" % (PROG, msg))
+    sys.exit(code)
+
+
+def load_aes():
+    try:
+        from Crypto.Cipher import AES  # noqa: F401
+        from Crypto.Hash import CMAC   # noqa: F401
+        return AES, CMAC
+    except Exception:
+        die(
+            "pycryptodome is required.\n"
+            "  Install it with:  python3 -m pip install --user pycryptodome\n"
+            "  (Debian/Ubuntu alt: sudo apt install python3-pycryptodome)"
+        )
+
+
+def parse_hexkey(s, name):
+    s = s.strip().replace(" ", "").replace(":", "")
+    try:
+        b = binascii.unhexlify(s)
+    except (binascii.Error, ValueError):
+        die("%s is not valid hex: %r" % (name, s))
+    if len(b) != 16:
+        die("%s must be 16 bytes (32 hex chars), got %d bytes" % (name, len(b)))
+    return b
+
+
+def human_magic(payload):
+    m = payload[:4]
+    return KNOWN_MAGIC.get(m, None), m
+
+
+def process_one(path, args, aes_key, cmac_key, AES, CMAC):
+    name = os.path.basename(path)
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except OSError as e:
+        eprint("%s: skip %s: %s" % (PROG, name, e))
+        return False
+
+    if len(data) == 0:
+        eprint("%s: skip %s: empty file" % (PROG, name))
+        return False
+    if len(data) % 16 != 0:
+        eprint("%s: skip %s: size %d is not a multiple of 16 (not CBC data?)"
+               % (PROG, name, len(data)))
+        return False
+    if len(data) < 32:
+        eprint("%s: skip %s: too small to hold a CMAC header" % (PROG, name))
+        return False
+
+    iv = bytes(16)
+    plaintext = AES.new(aes_key, AES.MODE_CBC, iv).decrypt(data)
+
+    stored_mac = plaintext[:16]
+    payload = plaintext[16:]
+
+    label, magic = human_magic(payload)
+
+    # Verify the CMAC over the payload.
+    verified = None
+    if not args.no_verify:
+        c = CMAC.new(cmac_key, ciphermod=AES)
+        c.update(payload)
+        calc = c.digest()
+        verified = (calc == stored_mac)
+
+    # Decide output bytes.
+    out = payload if args.strip else plaintext
+
+    # Decide output path.
+    if args.stdout:
+        outpath = None
+    elif args.output:
+        outpath = args.output
+    else:
+        base = name + args.suffix
+        outdir = args.outdir if args.outdir else os.path.dirname(os.path.abspath(path))
+        outpath = os.path.join(outdir, base)
+
+    # Report.
+    kind = label if label else "unknown (magic %s)" % magic.hex()
+    eprint("[%s] %s" % (name, kind))
+    eprint("    size        : %d bytes (payload %d bytes)" % (len(data), len(payload)))
+    eprint("    cmac (hdr)  : %s" % stored_mac.hex())
+    if verified is None:
+        eprint("    cmac check  : skipped")
+    elif verified:
+        eprint("    cmac check  : OK")
+    else:
+        c = CMAC.new(cmac_key, ciphermod=AES); c.update(payload)
+        eprint("    cmac check  : FAILED (calculated %s)" % c.digest().hex())
+        if not args.force:
+            eprint("    -> not writing output (use --force to write anyway, "
+                   "or --no-verify to skip the check)")
+            return False
+
+    if outpath is None:
+        sys.stdout.buffer.write(out)
+        sys.stdout.buffer.flush()
+        eprint("    wrote       : <stdout> (%d bytes)" % len(out))
+    else:
+        d = os.path.dirname(outpath)
+        if d and not os.path.isdir(d):
+            try:
+                os.makedirs(d, exist_ok=True)
+            except OSError as e:
+                die("cannot create output dir %s: %s" % (d, e))
+        try:
+            with open(outpath, "wb") as f:
+                f.write(out)
+        except OSError as e:
+            die("cannot write %s: %s" % (outpath, e))
+        eprint("    wrote       : %s (%d bytes%s)"
+               % (outpath, len(out), ", payload only" if args.strip else ""))
+
+    return (verified is not False)
+
+
+def build_parser():
+    p = argparse.ArgumentParser(
+        prog=PROG,
+        description="Decrypt sc_fw_update component images (BLNK/BASE/SYST) "
+                    "and verify their AES-CMAC.",
+        epilog="Default output: <input>%s next to each input file." % ".dec",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("files", nargs="+", metavar="FILE",
+                   help="encrypted component file(s), e.g. 40000001 40000002 40000003")
+    p.add_argument("-o", "--output", metavar="PATH",
+                   help="output file path (only valid with a single input FILE)")
+    p.add_argument("-C", "--outdir", metavar="DIR",
+                   help="write outputs into DIR instead of beside each input")
+    p.add_argument("-s", "--suffix", default=".dec", metavar="SUF",
+                   help="suffix for default output names (default: .dec)")
+    p.add_argument("--strip", action="store_true",
+                   help="strip the 16-byte CMAC header, write payload only")
+    p.add_argument("--stdout", action="store_true",
+                   help="write decrypted bytes to stdout (single FILE)")
+    p.add_argument("--no-verify", action="store_true",
+                   help="do not verify the AES-CMAC")
+    p.add_argument("--force", action="store_true",
+                   help="write output even if the CMAC check fails")
+    p.add_argument("--key", default=DEFAULT_KEY, metavar="HEX",
+                   help="AES-128-CBC key (32 hex chars); default is the published key")
+    p.add_argument("--cmac-key", default=DEFAULT_CMAC_KEY, metavar="HEX",
+                   help="AES-128-CMAC key (32 hex chars); default is the published key")
+    p.add_argument("-V", "--version", action="version",
+                   version="%(prog)s " + VERSION)
+    return p
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+
+    if args.output and len(args.files) > 1:
+        die("--output can only be used with a single input file")
+    if args.stdout and len(args.files) > 1:
+        die("--stdout can only be used with a single input file")
+    if args.stdout and (args.output or args.outdir):
+        die("--stdout cannot be combined with --output/--outdir")
+
+    aes_key = parse_hexkey(args.key, "AES key")
+    cmac_key = parse_hexkey(args.cmac_key, "CMAC key")
+
+    AES, CMAC = load_aes()
+
+    ok = True
+    for path in args.files:
+        if not process_one(path, args, aes_key, cmac_key, AES, CMAC):
+            ok = False
+    sys.exit(0 if ok else 2)
+
+
+if __name__ == "__main__":
+    main()
